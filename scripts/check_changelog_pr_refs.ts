@@ -1,31 +1,13 @@
 /**
  * This script checks that every changelog entry introduced by a pull request
- * references that pull request.  For each fragment holding such an entry it
- * verifies that:
+ * references that pull request: the trailing references of the entry have to
+ * include the pull request number, and the `links` frontmatter of its fragment
+ * has to map that number to `https://github.com/fedify-dev/fedify/pull/<n>`.
  *
- *  -  the trailing references at the end of the first paragraph of every
- *     introduced entry include the current pull request number, and
- *  -  the `links` frontmatter maps that number to
- *     `https://github.com/fedify-dev/fedify/pull/<number>`.
- *
- * Only the non-merge commits on the first-parent chain of the pull request
- * head count as the pull request's own work, so entries carried forward from
- * earlier pull requests through a merge (e.g., a maintenance branch
- * forward-port) are excluded.  The merge commits on that chain are followed
- * only to keep track of the introduced entries they move, rewrite, or delete.
- * Every entry of a fragment that the pull request adds is introduced by it.
- * In a fragment that already existed, each commit's top-level list items are
- * matched with those of its first parent:
- *
- *  -  an item with the same content, even if moved, is the same entry;
- *  -  an item similar enough to one left unmatched is a rewrite of it (see
- *     {@link isRewrite}), so edits to historical entries, including their
- *     first lines, nested items, and later lines, are excluded; and
- *  -  any other item is inserted, and thus introduced.
- *
- * The check runs against the head revision, so later edits to introduced
- * entries made in the same pull request are checked as well.  A pull request
- * without any changelog fragment passes.
+ * Only the pull request's own commits on the first-parent chain introduce
+ * entries, so historical entries, edits to them, and entries merged in from
+ * other branches are excluded.  A pull request without any changelog fragment
+ * passes.
  *
  * Usage:
  *
@@ -188,14 +170,9 @@ export async function findIntroducedFragments(
 }
 
 /**
- * Carry the introduced entries of a fragment across one change to it.
- *
- * @param before The entries before the change.
- * @param after The entries after the change.
- * @param introduced The indices of the introduced entries in `before`.
- * @param countInsertions Whether entries that the change inserts are
- *                        introduced, as opposed to carried in by a merge.
- * @returns The indices of the introduced entries in `after`.
+ * Carry the indices of the introduced entries across one change to a fragment.
+ * Entries that the change inserts count only if `countInsertions` is set,
+ * i.e., unless the change is a merge.
  */
 function followEntries(
   before: readonly Entry[],
@@ -206,9 +183,7 @@ function followEntries(
   // The index in `before` of the entry each entry in `after` derives from:
   const origins = new Array<number | undefined>(after.length);
   const matched = new Set<number>();
-  // Pair the most similar entries first, so that unchanged entries, even if
-  // moved, pair up before rewritten ones, and break ties, such as entries with
-  // the same first paragraph, by the rest of their content:
+  // Pair the most similar entries first, breaking ties by the whole content:
   const candidates: { origin: number; index: number; score: number[] }[] = [];
   after.forEach((entry, index) => {
     before.forEach((candidate, origin) => {
@@ -235,14 +210,9 @@ function followEntries(
 }
 
 /**
- * Tell whether an entry is a rewrite of another, rather than a new entry that
- * took its place.  The first paragraphs, without their trailing references,
- * have to be nearly the same, or at least similar if the entries share a
- * trailing reference: a rewritten entry keeps referring to the issue and the
- * pull request it describes, while a new one refers to its own.
- *
- * @returns The similarity of the entries if one is a rewrite of the other,
- *          or 0 otherwise.
+ * Return the similarity of two entries if one is a rewrite of the other, or 0
+ * if it is a new entry instead.  A rewrite usually keeps its trailing
+ * references, so sharing one lowers the similarity required.
  */
 function isRewrite(original: Entry, rewritten: Entry): number {
   const similarity = diceCoefficient(
@@ -331,9 +301,12 @@ function extractEntries(content: string): Entry[] {
   }
   return items.map((lines) => {
     const trimmed = lines.map((line) => line.trim());
-    const blank = trimmed.indexOf("");
+    // The first paragraph ends at a blank line or where a nested list starts:
+    const end = trimmed.findIndex((line, index) =>
+      index > 0 && (line === "" || /^(?:[-*+]|\d+[.)]) /.test(line))
+    );
     return {
-      paragraph: trimmed.slice(0, blank < 0 ? undefined : blank).join(" ")
+      paragraph: trimmed.slice(0, end < 0 ? undefined : end).join(" ")
         .replace(/^[-*+] +/, ""),
       text: trimmed.filter((line) => line !== "").join("\n"),
     };
@@ -398,10 +371,16 @@ export function checkFragment(
 
   const ref = `#${pullRequest}`;
   const expectedUrl = `${PULL_REQUEST_URL_PREFIX}${pullRequest}`;
+  // Other entries' pull requests are not wrong predictions:
+  const cited = new Set(
+    selected.flatMap(({ entry }) =>
+      extractTrailingReferences(entry.paragraph) ?? []
+    ),
+  );
   const otherPullRequests = parsed.links == null
     ? []
     : findLinkedPullRequests(parsed.links)
-      .filter((number) => number !== pullRequest);
+      .filter((number) => number !== pullRequest && cited.has(number));
   const predictionHint = otherPullRequests.length > 0
     ? `  It links to ${
       otherPullRequests.map((n) => `#${n}`).join(", ")

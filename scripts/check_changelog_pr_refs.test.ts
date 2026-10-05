@@ -141,6 +141,38 @@ describe("checkFragment()", () => {
     match(violations[1].message, /entry 2/);
   });
 
+  it("accepts references followed directly by a nested list", () => {
+    const content = [
+      "---",
+      "links:",
+      `  '#456': ${pull(456)}`,
+      "---",
+      " -  Added options.  [[#123], [#456]]",
+      "     -  `foo` option.",
+      "     -  `bar` option.",
+      "",
+    ].join("\n");
+    deepStrictEqual(checkFragment(PATH, content, 456), []);
+  });
+
+  it("hints only at pull requests the checked entries cite", () => {
+    const content = [
+      "---",
+      "links:",
+      `  '#7': ${pull(7)}`,
+      "---",
+      " -  Added foo.  [[#7]]",
+      "",
+      " -  Added bar.  [[#123]]",
+      "",
+    ].join("\n");
+    const violations = checkFragment(PATH, content, 456, new Set([1]));
+    strictEqual(violations.length, 2);
+    for (const { message } of violations) {
+      strictEqual(message.includes("links to #7"), false, message);
+    }
+  });
+
   it("reports malformed frontmatter", () => {
     const content = "---\nlinks: [\n---\n -  Added foo.  [[#456]]\n";
     const violations = checkFragment(PATH, content, 456);
