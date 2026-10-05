@@ -135,19 +135,10 @@ describe("checkFragment()", () => {
       " -  Added bar.  [[#123]]",
       "",
     ].join("\n");
-    const violations = checkFragment(
-      PATH,
-      content,
-      456,
-      new Set([" -  Added bar.  [[#123]]"]),
-    );
+    const violations = checkFragment(PATH, content, 456, new Set([1]));
     strictEqual(violations.length, 2);
     match(violations[0].message, /no entry for '#456'/);
     match(violations[1].message, /entry 2/);
-    deepStrictEqual(
-      checkFragment(PATH, content, 456, new Set([" -  Removed baz."])),
-      [],
-    );
   });
 
   it("reports malformed frontmatter", () => {
@@ -171,10 +162,16 @@ describe("parseNameStatusLog()", () => {
       "R095\tchanges.d/cli/added.md\tchanges.d/fedify/added.md",
       "R100\tchanges.d/cli/old.md\tdocs/old.md",
       "D\tchanges.d/cli/deleted.md",
+      "commit 3333333333333333333333333333333333333333 " +
+      "2222222222222222222222222222222222222222 " +
+      "4444444444444444444444444444444444444444",
+      "",
+      "M\tchanges.d/cli/merged.md",
     ].join("\n");
     deepStrictEqual(parseNameStatusLog(log), [
       {
         commit: "1111111111111111111111111111111111111111",
+        merge: false,
         changes: [
           {
             status: "A",
@@ -190,6 +187,7 @@ describe("parseNameStatusLog()", () => {
       },
       {
         commit: "2222222222222222222222222222222222222222",
+        merge: false,
         changes: [
           {
             status: "R",
@@ -205,6 +203,17 @@ describe("parseNameStatusLog()", () => {
             status: "D",
             path: "changes.d/cli/deleted.md",
             oldPath: "changes.d/cli/deleted.md",
+          },
+        ],
+      },
+      {
+        commit: "3333333333333333333333333333333333333333",
+        merge: true,
+        changes: [
+          {
+            status: "M",
+            path: "changes.d/cli/merged.md",
+            oldPath: "changes.d/cli/merged.md",
           },
         ],
       },
@@ -225,6 +234,7 @@ describe("findIntroducedFragments()", () => {
       [
         {
           commit: "c1",
+          merge: false,
           changes: [
             {
               status: "A",
@@ -245,6 +255,7 @@ describe("findIntroducedFragments()", () => {
         },
         {
           commit: "c2",
+          merge: false,
           changes: [
             {
               status: "R",
@@ -263,10 +274,7 @@ describe("findIntroducedFragments()", () => {
     );
     deepStrictEqual(introduced, [
       { path: "changes.d/cli/added.md", entries: "all" },
-      {
-        path: "changes.d/cli/historical.md",
-        entries: new Set([" -  New entry.  [[#456]]"]),
-      },
+      { path: "changes.d/cli/historical.md", entries: new Set([1]) },
     ]);
   });
 });
@@ -331,11 +339,13 @@ describe("checkChangelogPrRefs()", () => {
   }
 
   /**
-   * Set up a repository whose `main` branch contains a historical fragment,
-   * check out a `pr` branch from it, and run `scenario` on that branch.
+   * Set up a repository whose `main` branch contains a historical fragment
+   * and `files`, check out a `pr` branch from it, and run `scenario` on that
+   * branch.
    */
   async function withRepository(
     scenario: (root: string) => Promise<void>,
+    files: Record<string, string> = {},
   ): Promise<Awaited<ReturnType<typeof checkChangelogPrRefs>>> {
     const root = await Deno.makeTempDir();
     try {
@@ -343,6 +353,7 @@ describe("checkChangelogPrRefs()", () => {
       await commit(root, {
         "changes.d/next.txt": "1.0.0\n",
         [historicalPath]: historical,
+        ...files,
       });
       await git(root, "switch", "--quiet", "-c", "pr");
       await scenario(root);
@@ -453,6 +464,136 @@ describe("checkChangelogPrRefs()", () => {
     deepStrictEqual(result, { fragments: [], violations: [] });
   });
 
+  it("excludes historical entries whose first line is edited", async () => {
+    const result = await withRepository(async (root) => {
+      await commit(root, {
+        [historicalPath]: historical.replace("foo would bar", "foo would baz"),
+      });
+    });
+    deepStrictEqual(result, { fragments: [], violations: [] });
+  });
+
+  it("tells inserted entries from adjacent edited ones", async () => {
+    const result = await withRepository(async (root) => {
+      await commit(root, {
+        [historicalPath]: historical.replace(
+          "---\n -  Fixed a bug where foo would bar",
+          "---\n -  Added baz.  [[#123]]\n\n -  Fixed a bug where foo would baz",
+        ),
+      });
+    });
+    deepStrictEqual(result.fragments, [historicalPath]);
+    strictEqual(result.violations.length, 2);
+    match(result.violations[0].message, /no entry for '#456'/);
+    match(result.violations[1].message, /entry 1 \(\[#123\]\)/);
+  });
+
+  it("excludes historical entries reworded", async () => {
+    const result = await withRepository(async (root) => {
+      await commit(root, {
+        [historicalPath]: historical.replace(
+          "foo would bar, which was fixed\n    long ago.",
+          "`foo()` returned `bar` instead of `baz`, fixed long ago.",
+        ),
+      });
+    });
+    deepStrictEqual(result, { fragments: [], violations: [] });
+  });
+
+  it("checks new entries replacing historical ones", async () => {
+    const result = await withRepository(async (root) => {
+      await commit(root, {
+        [historicalPath]: historical.replace(
+          /---\n -[^]*$/,
+          "---\n -  Fixed a crash in the inbox handler.  [[#9]]\n",
+        ),
+      });
+    });
+    deepStrictEqual(result.fragments, [historicalPath]);
+    strictEqual(result.violations.length, 2);
+    match(result.violations[0].message, /no entry for '#456'/);
+    match(result.violations[1].message, /entry \(\[#9\]\)/);
+
+    const path = "changes.d/fedify/method.md";
+    const similar = await withRepository(async (root) => {
+      await commit(root, {
+        [path]: " -  Added `Context.bar()` method.  [[#123]]\n",
+      });
+    }, { [path]: " -  Added `Federation.foo()` method.  [[#7]]\n" });
+    deepStrictEqual(similar.fragments, [path]);
+    strictEqual(similar.violations.length, 2);
+    match(similar.violations[1].message, /entry \(\[#123\]\)/);
+  });
+
+  it("excludes historical entries with corrected references", async () => {
+    const result = await withRepository(async (root) => {
+      await commit(root, {
+        [historicalPath]: historical
+          .replace("foo would bar", "foo would baz")
+          .replace("[[#7]]", "[[#8]]"),
+      });
+    });
+    deepStrictEqual(result, { fragments: [], violations: [] });
+  });
+
+  it("checks new entries sharing the first paragraph of a historical entry", async () => {
+    const path = "changes.d/fedify/apis.md";
+    const entry = (references: string, api: string) =>
+      ` -  Added new APIs.  ${references}\n\n     -  \`${api}()\`\n`;
+    const result = await withRepository(async (root) => {
+      await commit(root, {
+        [path]: `${entry("[[#123]]", "bar")}\n${entry("[[#7]]", "foo")}`,
+      });
+    }, { [path]: entry("[[#7]]", "foo") });
+    deepStrictEqual(result.fragments, [path]);
+    strictEqual(result.violations.length, 2);
+    match(result.violations[1].message, /entry 1 \(\[#123\]\)/);
+  });
+
+  it("excludes historical entries moved within a fragment", async () => {
+    const path = "changes.d/cli/two.md";
+    const result = await withRepository(async (root) => {
+      await commit(root, {
+        [path]: " -  Added bar.  [[#2]]\n\n -  Added foo.  [[#1]]\n",
+      });
+    }, { [path]: " -  Added foo.  [[#1]]\n\n -  Added bar.  [[#2]]\n" });
+    deepStrictEqual(result, { fragments: [], violations: [] });
+  });
+
+  it("counts entries in fragments with a lone carriage return", async () => {
+    const path = "changes.d/cli/cr.md";
+    const result = await withRepository(async (root) => {
+      await commit(root, {
+        [path]: " -  Fixed foo\rbar.  [[#7]]\n\n -  Added baz.  [[#123]]\n",
+      });
+    }, { [path]: " -  Fixed foo\rbar.  [[#7]]\n" });
+    deepStrictEqual(result.fragments, [path]);
+    strictEqual(result.violations.length, 2);
+    match(result.violations[1].message, /entry 2 \(\[#123\]\)/);
+  });
+
+  it("checks new entries sharing the first line of a historical entry", async () => {
+    const twin = " -  Fixed a bug where foo would bar, which was fixed\n" +
+      "    just now.  [[#123]]\n";
+    const appended = await withRepository(async (root) => {
+      await commit(root, { [historicalPath]: `${historical}\n${twin}` });
+    });
+    deepStrictEqual(appended.fragments, [historicalPath]);
+    strictEqual(appended.violations.length, 2);
+    match(appended.violations[0].message, /no entry for '#456'/);
+    match(appended.violations[1].message, /entry 2 \(\[#123\]\)/);
+
+    const prepended = await withRepository(async (root) => {
+      await commit(root, {
+        [historicalPath]: historical.replace("---\n -", `---\n${twin}\n -`),
+      });
+    });
+    deepStrictEqual(prepended.fragments, [historicalPath]);
+    strictEqual(prepended.violations.length, 2);
+    match(prepended.violations[0].message, /no entry for '#456'/);
+    match(prepended.violations[1].message, /entry 1 \(\[#123\]\)/);
+  });
+
   it("excludes nested items added to historical entries", async () => {
     const result = await withRepository(async (root) => {
       await commit(root, {
@@ -485,5 +626,79 @@ describe("checkChangelogPrRefs()", () => {
       fragments: ["changes.d/cli/foo.md"],
       violations: [],
     });
+  });
+
+  it("follows introduced entries moved by a merge", async () => {
+    const result = await withRepository(async (root) => {
+      await git(root, "switch", "--quiet", "-c", "maintenance", "main");
+      await commit(root, {
+        [historicalPath]: historical.replace(
+          "---\n -",
+          "---\n -  Added qux.  [[#8]]\n\n -",
+        ),
+      });
+      await git(root, "switch", "--quiet", "pr");
+      await commit(root, {
+        [historicalPath]: `${historical}\n -  Added baz.  [[#123], [#456]]\n`,
+      });
+      await git(
+        root,
+        "merge",
+        "--quiet",
+        "--no-ff",
+        "-m",
+        "merge",
+        "maintenance",
+      );
+      const merged = await Deno.readTextFile(join(root, historicalPath));
+      await commit(root, {
+        [historicalPath]: merged.replace(
+          "\n---\n",
+          `\n  '#456': ${pull(456)}\n---\n`,
+        ),
+      });
+    });
+    deepStrictEqual(result, { fragments: [historicalPath], violations: [] });
+  });
+
+  it("excludes entries merged into fragments added by the pull request", async () => {
+    const path = "changes.d/cli/foo.md";
+    const result = await withRepository(async (root) => {
+      await git(root, "switch", "--quiet", "-c", "maintenance", "main");
+      await commit(root, { [path]: " -  Added qux.  [[#8]]\n" });
+      await git(root, "switch", "--quiet", "pr");
+      await commit(root, { [path]: valid });
+      await git(
+        root,
+        "merge",
+        "--quiet",
+        "--no-ff",
+        "--no-commit",
+        "--strategy=ours",
+        "maintenance",
+      );
+      await commit(root, { [path]: `${valid}\n -  Added qux.  [[#8]]\n` });
+    });
+    deepStrictEqual(result, { fragments: [path], violations: [] });
+  });
+
+  it("ignores fragments deleted by a merge", async () => {
+    const result = await withRepository(async (root) => {
+      await git(root, "switch", "--quiet", "-c", "maintenance", "main");
+      await commit(root, { [historicalPath]: null });
+      await git(root, "switch", "--quiet", "pr");
+      await commit(root, { [historicalPath]: withNewEntry("", "[[#123]]") });
+      await git(
+        root,
+        "merge",
+        "--quiet",
+        "--no-ff",
+        "--no-commit",
+        "--strategy=ours",
+        "maintenance",
+      );
+      await commit(root, { [historicalPath]: null });
+    });
+    deepStrictEqual(result, { fragments: [], violations: [] });
   });
 });

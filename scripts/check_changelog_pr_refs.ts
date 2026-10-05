@@ -11,14 +11,21 @@
  * Only the non-merge commits on the first-parent chain of the pull request
  * head count as the pull request's own work, so entries carried forward from
  * earlier pull requests through a merge (e.g., a maintenance branch
- * forward-port) are excluded.  Every entry of a fragment that the pull
- * request adds is introduced by it.  In a fragment that already existed, an
- * entry is introduced when one of those commits adds the first line of the
- * top-level list item, so the historical entries of that fragment, including
- * those whose nested items or later lines the pull request edits, are
- * excluded.  The check runs against the head revision, so later edits to
- * introduced entries made in the same pull request are checked as well.  A
- * pull request without any changelog fragment passes.
+ * forward-port) are excluded.  The merge commits on that chain are followed
+ * only to keep track of the introduced entries they move, rewrite, or delete.
+ * Every entry of a fragment that the pull request adds is introduced by it.
+ * In a fragment that already existed, each commit's top-level list items are
+ * matched with those of its first parent:
+ *
+ *  -  an item with the same content, even if moved, is the same entry;
+ *  -  an item similar enough to one left unmatched is a rewrite of it (see
+ *     {@link isRewrite}), so edits to historical entries, including their
+ *     first lines, nested items, and later lines, are excluded; and
+ *  -  any other item is inserted, and thus introduced.
+ *
+ * The check runs against the head revision, so later edits to introduced
+ * entries made in the same pull request are checked as well.  A pull request
+ * without any changelog fragment passes.
  *
  * Usage:
  *
@@ -60,6 +67,8 @@ export interface FragmentChange {
 export interface CommitChanges {
   /** The commit hash. */
   readonly commit: string;
+  /** Whether the commit is a merge; its changes are against the first parent. */
+  readonly merge: boolean;
   /** The changes, in the order Git reported them. */
   readonly changes: readonly FragmentChange[];
 }
@@ -69,18 +78,27 @@ function isFragmentPath(path: string): boolean {
 }
 
 /**
- * Parse the output of `git log --name-status --format="commit %H"`.
+ * Parse the output of `git log --name-status --format="commit %H %P"`.
  *
  * @param log The output of `git log` over the commits of the pull request.
  * @returns The changes to changelog fragments, grouped by commit, in the
  *          order the commits appear in `log`.
  */
 export function parseNameStatusLog(log: string): CommitChanges[] {
-  const commits: { commit: string; changes: FragmentChange[] }[] = [];
+  const commits: {
+    commit: string;
+    merge: boolean;
+    changes: FragmentChange[];
+  }[] = [];
   for (const line of log.split("\n")) {
-    const header = /^commit ([0-9a-f]+)$/.exec(line);
+    const header = /^commit ([0-9a-f]+)((?: [0-9a-f]+)*) ?$/.exec(line);
     if (header != null) {
-      commits.push({ commit: header[1], changes: [] });
+      const parents = header[2].trim().split(" ").filter((p) => p !== "");
+      commits.push({
+        commit: header[1],
+        merge: parents.length > 1,
+        changes: [],
+      });
       continue;
     }
     const current = commits.at(-1);
@@ -112,15 +130,17 @@ export interface IntroducedFragment {
   readonly path: string;
   /**
    * `"all"` if the pull request added the fragment itself; otherwise, the
-   * first lines of the top-level list items that the pull request added.
+   * 0-based indices of the top-level list items, as of the head revision,
+   * that the pull request added.
    */
-  readonly entries: "all" | ReadonlySet<string>;
+  readonly entries: "all" | ReadonlySet<number>;
 }
 
 /**
  * Determine which changelog entries a series of commits introduces.
  *
- * @param commits The changes of the pull request's own commits, oldest first.
+ * @param commits The changes of the commits on the first-parent chain of the
+ *                pull request, oldest first.
  * @param readFile Reads a file at a revision.  It is only asked for files
  *                 that exist at that revision.
  * @returns The fragments holding introduced entries, sorted by path.
@@ -129,29 +149,37 @@ export async function findIntroducedFragments(
   commits: readonly CommitChanges[],
   readFile: (revision: string, path: string) => Promise<string>,
 ): Promise<IntroducedFragment[]> {
-  const introduced = new Map<string, "all" | Set<string>>();
-  for (const { commit, changes } of commits) {
+  const introduced = new Map<string, "all" | ReadonlySet<number>>();
+  for (const { commit, merge, changes } of commits) {
     for (const change of changes) {
-      if (change.status === "A") {
-        introduced.set(change.path, "all");
-        continue;
-      } else if (change.status === "D") {
+      if (change.status === "D" || (change.status === "A" && merge)) {
         introduced.delete(change.path);
         continue;
+      } else if (change.status === "A") {
+        introduced.set(change.path, "all");
+        continue;
       }
-      let entries = introduced.get(change.oldPath);
+      const entries = introduced.get(change.oldPath);
       introduced.delete(change.oldPath);
-      if (entries !== "all") {
-        const before = new Set(
-          extractEntries(await readFile(`${commit}^`, change.oldPath))
-            .map((entry) => entry.firstLine),
-        );
-        const added = extractEntries(await readFile(commit, change.path))
-          .map((entry) => entry.firstLine)
-          .filter((firstLine) => !before.has(firstLine));
-        if (added.length > 0) entries = new Set([...entries ?? [], ...added]);
+      if (entries === "all" && !merge) {
+        introduced.set(change.path, entries);
+        continue;
+      } else if (entries == null && merge) {
+        continue;
       }
-      if (entries != null) introduced.set(change.path, entries);
+      const [before, after] = await Promise.all([
+        readFile(`${commit}^`, change.oldPath).then(extractEntries),
+        readFile(commit, change.path).then(extractEntries),
+      ]);
+      const followed = followEntries(
+        before,
+        after,
+        // A merge may bring entries into a fragment the pull request added, so
+        // its entries are tracked one by one from then on:
+        entries === "all" ? new Set(before.keys()) : entries ?? new Set(),
+        !merge,
+      );
+      if (followed.size > 0) introduced.set(change.path, followed);
     }
   }
   return [...introduced]
@@ -159,12 +187,101 @@ export async function findIntroducedFragments(
     .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
 }
 
+/**
+ * Carry the introduced entries of a fragment across one change to it.
+ *
+ * @param before The entries before the change.
+ * @param after The entries after the change.
+ * @param introduced The indices of the introduced entries in `before`.
+ * @param countInsertions Whether entries that the change inserts are
+ *                        introduced, as opposed to carried in by a merge.
+ * @returns The indices of the introduced entries in `after`.
+ */
+function followEntries(
+  before: readonly Entry[],
+  after: readonly Entry[],
+  introduced: ReadonlySet<number>,
+  countInsertions: boolean,
+): Set<number> {
+  // The index in `before` of the entry each entry in `after` derives from:
+  const origins = new Array<number | undefined>(after.length);
+  const matched = new Set<number>();
+  // Pair the most similar entries first, so that unchanged entries, even if
+  // moved, pair up before rewritten ones, and break ties, such as entries with
+  // the same first paragraph, by the rest of their content:
+  const candidates: { origin: number; index: number; score: number[] }[] = [];
+  after.forEach((entry, index) => {
+    before.forEach((candidate, origin) => {
+      const similarity = isRewrite(candidate, entry);
+      if (similarity <= 0) return;
+      const score = [similarity, diceCoefficient(candidate.text, entry.text)];
+      candidates.push({ origin, index, score });
+    });
+  });
+  candidates.sort((a, b) => b.score[0] - a.score[0] || b.score[1] - a.score[1]);
+  for (const { origin, index } of candidates) {
+    if (matched.has(origin) || origins[index] != null) continue;
+    origins[index] = origin;
+    matched.add(origin);
+  }
+  const result = new Set<number>();
+  for (let index = 0; index < after.length; index++) {
+    const origin = origins[index];
+    if (origin == null ? countInsertions : introduced.has(origin)) {
+      result.add(index);
+    }
+  }
+  return result;
+}
+
+/**
+ * Tell whether an entry is a rewrite of another, rather than a new entry that
+ * took its place.  The first paragraphs, without their trailing references,
+ * have to be nearly the same, or at least similar if the entries share a
+ * trailing reference: a rewritten entry keeps referring to the issue and the
+ * pull request it describes, while a new one refers to its own.
+ *
+ * @returns The similarity of the entries if one is a rewrite of the other,
+ *          or 0 otherwise.
+ */
+function isRewrite(original: Entry, rewritten: Entry): number {
+  const similarity = diceCoefficient(
+    stripTrailingReferences(original.paragraph),
+    stripTrailingReferences(rewritten.paragraph),
+  );
+  if (similarity >= 0.8) return similarity;
+  const references = extractTrailingReferences(rewritten.paragraph) ?? [];
+  const shared = extractTrailingReferences(original.paragraph)
+    ?.some((reference) => references.includes(reference));
+  return shared && similarity >= 0.5 ? similarity : 0;
+}
+
+/** The Sørensen–Dice coefficient of the character bigrams of two strings. */
+function diceCoefficient(a: string, b: string): number {
+  if (a === b) return 1;
+  const bigrams = new Map<string, number>();
+  for (let i = 0; i < a.length - 1; i++) {
+    const bigram = a.slice(i, i + 2);
+    bigrams.set(bigram, (bigrams.get(bigram) ?? 0) + 1);
+  }
+  let shared = 0;
+  for (let i = 0; i < b.length - 1; i++) {
+    const bigram = b.slice(i, i + 2);
+    const count = bigrams.get(bigram) ?? 0;
+    if (count < 1) continue;
+    bigrams.set(bigram, count - 1);
+    shared++;
+  }
+  const total = Math.max(a.length - 1, 0) + Math.max(b.length - 1, 0);
+  return total < 1 ? 0 : 2 * shared / total;
+}
+
 /** A top-level list item of a changelog fragment. */
 interface Entry {
-  /** The line holding the list marker, without trailing whitespace. */
-  readonly firstLine: string;
   /** The first paragraph of the item, joined into one line. */
   readonly paragraph: string;
+  /** The non-blank lines of the item, trimmed, to compare items with. */
+  readonly text: string;
 }
 
 /** The pieces of a changelog fragment relevant to this check. */
@@ -207,29 +324,20 @@ function extractEntries(content: string): Entry[] {
   const text = normalizeNewlines(content);
   const frontmatter = FRONTMATTER_PATTERN.exec(text);
   const body = frontmatter == null ? text : text.slice(frontmatter[0].length);
-  const entries: Entry[] = [];
-  let current: { firstLine: string; lines: string[] } | null = null;
-  let inFirstParagraph = false;
-  const flush = () => {
-    if (current == null) return;
-    entries.push({
-      firstLine: current.firstLine,
-      paragraph: current.lines.join(" "),
-    });
-  };
+  const items: string[][] = [];
   for (const line of body.split("\n")) {
-    const marker = /^ {0,3}[-*+] +(.*)$/.exec(line);
-    if (marker != null) {
-      flush();
-      current = { firstLine: line.trimEnd(), lines: [marker[1].trim()] };
-      inFirstParagraph = true;
-    } else if (current != null && inFirstParagraph) {
-      if (line.trim() === "") inFirstParagraph = false;
-      else current.lines.push(line.trim());
-    }
+    if (/^ {0,3}[-*+] /.test(line)) items.push([line]);
+    else items.at(-1)?.push(line);
   }
-  flush();
-  return entries;
+  return items.map((lines) => {
+    const trimmed = lines.map((line) => line.trim());
+    const blank = trimmed.indexOf("");
+    return {
+      paragraph: trimmed.slice(0, blank < 0 ? undefined : blank).join(" ")
+        .replace(/^[-*+] +/, ""),
+      text: trimmed.filter((line) => line !== "").join("\n"),
+    };
+  });
 }
 
 /**
@@ -243,6 +351,10 @@ function extractTrailingReferences(paragraph: string): number[] | null {
   const match = TRAILING_REFERENCES_PATTERN.exec(paragraph);
   if (match == null) return null;
   return Array.from(match[1].matchAll(/\[#(\d+)\]/g), (m) => Number(m[1]));
+}
+
+function stripTrailingReferences(paragraph: string): string {
+  return paragraph.replace(TRAILING_REFERENCES_PATTERN, "").trimEnd();
 }
 
 /** Return the numbers of the pull requests that `links` points to. */
@@ -267,24 +379,22 @@ function findLinkedPullRequests(
  * @param path The fragment path, used in the returned violations.
  * @param content The fragment content.
  * @param pullRequest The number of the current pull request.
- * @param entries The entries to check: `"all"`, or the first lines of the
- *                introduced entries as returned by
- *                {@link findIntroducedFragments}.  If none of the given
- *                entries remain in `content`, nothing is checked.
+ * @param entries The entries to check: `"all"`, or the 0-based indices of the
+ *                introduced top-level list items as returned by
+ *                {@link findIntroducedFragments}.
  * @returns The problems found, or an empty array if there are none.
  */
 export function checkFragment(
   path: string,
   content: string,
   pullRequest: number,
-  entries: "all" | ReadonlySet<string> = "all",
+  entries: "all" | ReadonlySet<number> = "all",
 ): Violation[] {
   const parsed = parseFragment(content);
   if (typeof parsed === "string") return [{ path, message: parsed }];
   const selected = parsed.entries
     .map((entry, index) => ({ entry, index }))
-    .filter(({ entry }) => entries === "all" || entries.has(entry.firstLine));
-  if (entries !== "all" && selected.length < 1) return [];
+    .filter(({ index }) => entries === "all" || entries.has(index));
 
   const ref = `#${pullRequest}`;
   const expectedUrl = `${PULL_REQUEST_URL_PREFIX}${pullRequest}`;
@@ -386,11 +496,11 @@ export async function checkChangelogPrRefs(
     "core.quotePath=false",
     "log",
     "--first-parent",
-    "--no-merges",
+    "--diff-merges=first-parent",
     "--reverse",
     "--find-renames",
     "--name-status",
-    "--format=commit %H",
+    "--format=commit %H %P",
     `${options.base}..${options.head}`,
     "--",
     FRAGMENTS_DIRECTORY,
@@ -405,12 +515,16 @@ export async function checkChangelogPrRefs(
   const violations: Violation[] = [];
   for (const { path, entries } of introduced) {
     const content = await readFile(options.head, path);
-    if (
-      entries !== "all" &&
-      !extractEntries(content).some((entry) => entries.has(entry.firstLine))
-    ) {
-      // The pull request added entries but removed or rewrote them later:
-      continue;
+    if (entries !== "all") {
+      const count = extractEntries(content).length;
+      const missing = [...entries].filter((index) => index >= count);
+      if (missing.length > 0) {
+        throw new Error(
+          `${path}: could not find the introduced entries ${
+            missing.map((index) => index + 1).join(", ")
+          } at ${options.head}.`,
+        );
+      }
     }
     fragments.push(path);
     violations.push(
